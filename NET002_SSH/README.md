@@ -22,10 +22,10 @@ file receive.
 Or manually:
 
 ```bash
-cl65 -t atari -o build/ssh_terminal.com src/ssh_terminal.c src/intr.s
+cl65 -t atari -o build/ssh_terminal.com src/ssh_terminal.c src/intr.s src/hsio.s
 ```
 
-Output: `build/ssh_terminal.com` (~18 KB).
+Output: `build/ssh_terminal.com` (~20 KB).
 
 ## Usage
 
@@ -360,6 +360,180 @@ components are stripped, illegal characters replaced with `_`, and the
 
 During transfer, a progress bar is displayed: `D:filename [.......] N bytes received.`  Each dot represents 1 KB of data received.
 
+### High-Speed SIO (HSIO)
+
+The terminal negotiates high-speed SIO with FujiNet to increase data
+transfer rates from ~19200 baud to ~112 kbit/s (~5x speedup).  This
+primarily benefits ZMODEM file transfers (37 KB: ~20 s → ~4 s).
+
+#### HSIO Negotiation
+
+At startup (before opening the SSH connection), the terminal sends the
+SIO `$3F` command (Get High Speed Index) to FujiNet device `$71`:
+
+```c
+static unsigned char net_get_hsio_index(void)
+{
+    /* ... */
+    OS.dcb.dcomnd = 0x3F;      /* Get High Speed Index */
+    OS.dcb.dstats = 0x40;      /* device→Atari (read) */
+    OS.dcb.dbuf   = &index;
+    OS.dcb.dbyt   = 1;
+    /* ... */
+}
+```
+
+FujiNet responds with a speed index (0 = not supported, 1 = ~112 kbit,
+2 = ~97 kbit, etc.).  The index maps to a POKEY AUDF3 divisor value:
+
+| Index | AUDF3  | Baud rate  |
+|-------|--------|------------|
+| 0     | `$28`  | ~19200     |
+| 1     | `$01`  | ~112 kbit  |
+| 2     | `$02`  | ~97 kbit   |
+| 3     | `$03`  | ~85 kbit   |
+
+If the device reports index 0 or the `$3F` command fails, the terminal
+continues at standard 19200 baud speed.
+
+#### OS ROM Patching
+
+The Atari OS SIOV routine hardcodes the SIO baud rate by programming
+POKEY AUDF3 with `$28` (19200 baud) on every SIO call.  To use high
+speed, the terminal patches the OS ROM in RAM so SIOV programs AUDF3
+with the negotiated divisor instead.
+
+##### Pattern Scanning
+
+The terminal scans OS ROM/RAM (`$D800`–`$FEFF`) for known code patterns
+to locate the AUDF3 byte(s).  Three strategies are tried in order,
+supporting different OS kernels:
+
+**Strategy 1 — OSXL device-type check** (for OSXL / OSXL 65c816):
+
+The OSXL SIO routine checks the device type to decide the baud rate.
+For non-disk devices (like FujiNet at `$71`), it defaults to
+`LDA #$28`.  The terminal scans for the device-check instruction
+sequence and follows the BNE branch to find the target:
+
+```
+AD 00 03    LDA $0300       ; load device ID (DDEVIC)
+29 70       AND #$70        ; mask device type bits
+C9 30       CMP #$30        ; compare with disk ($3x)
+D0 xx       BNE offset      ; branch if not disk
+```
+
+The BNE target contains `A9 xx` (LDA #immediate) — the operand is the
+AUDF3 byte to patch.
+
+**Strategy 2 — OSXL init function** (fallback):
+
+Scans for `A9 xx 85 3F` (LDA #xx; STA $3F), where zero-page `$3F` is
+the OSXL's AUDF3 output-direction variable.
+
+**Strategy 3 — Altirra kernel regdata_normal** (for built-in kernel):
+
+The Altirra kernel programs POKEY from a 9-byte register data table.
+The terminal scans for the table pattern `00 A0 00 A0 xx A0 00 A0`
+and patches the AUDF3 byte at offset +4.
+
+All three strategies match by surrounding context bytes only — the
+AUDF3 byte itself is not required to be `$28`.  This allows the scan
+to succeed on repeat runs where the byte was already patched.
+
+##### ROM Copy via Toggle
+
+To patch OS ROM, the code in RAM at the ROM addresses must contain a
+copy of the ROM contents.  On real Atari XL hardware, writes to ROM
+addresses pass through to underlying RAM.  However, **Altirra's memory
+manager discards writes to ROM-mapped addresses** (they go to a dummy
+write handler, not to RAM).
+
+The workaround (`copy_rom_disable` in `hsio.s`) toggles ROM on and off
+for each 256-byte page:
+
+```asm
+copy_one_page:
+        ; Step 1: ROM enabled — read page into temp buffer
+        ldy     #$00
+@rd:    lda     (ptr),y         ; reads from ROM
+        sta     rombuf,y        ; writes to BSS buffer
+        iny
+        bne     @rd
+
+        ; Step 2: Disable ROM — expose underlying RAM
+        lda     PORTB
+        and     #$FE            ; clear bit 0
+        sta     PORTB
+
+        ; Step 3: Write buffer to RAM
+        ldy     #$00
+@wr:    lda     rombuf,y
+        sta     (ptr),y         ; writes to RAM (ROM disabled)
+        iny
+        bne     @wr
+
+        ; Step 4: Re-enable ROM for next page
+        lda     PORTB
+        ora     #$01
+        sta     PORTB
+        rts
+```
+
+This copies 56 pages (14 KB: `$C000`–`$CFFF` math pack + `$D800`–`$FFFF`
+OS ROM) in ~80 ms with interrupts disabled.  After all pages are copied,
+ROM is disabled permanently (PORTB bit 0 cleared) and the CPU runs from
+the RAM copy.
+
+On repeat runs, the ROM copy is skipped if PORTB bit 0 is already 0
+(ROM already disabled from a previous run).
+
+##### Multi-Target Patching
+
+After the ROM copy, `enable_hsio_if_available()` patches all relevant
+locations — not just the primary target:
+
+1. **Primary target** from `find_sio_speed_byte()` (the device-check
+   branch target or regdata_normal entry).
+2. **All OSXL init sequences**: scans for `A9 xx 85 3F` and patches
+   the operand.  This covers the OSXL SIO init function and any other
+   code path that sets zero-page `$3F`.
+3. **All regdata_normal tables**: scans for `00 A0 00 A0 xx A0 00 A0`
+   and patches offset +4.  Only AUDF3 is changed — AUDCTL at offset +8
+   (`$28` = clock channels 3&4 at 1.79 MHz) is left untouched.
+4. **Zero-page `$3F`/`$40`**: POKEd with the new AUDF3 value for
+   immediate use by the next SIOV call (OSXL only).
+
+#### NetSIO Integration
+
+When running under the Altirra emulator with the NetSIO custom device
+(`netsio.atdevice`), the speed change propagates automatically.  NetSIO
+operates in raw SIO mode (`$sio.enable_raw(true)`) and detects baud
+rate changes by monitoring the per-byte timing (`$aux` variable in
+`recv_raw_byte()`).
+
+The `$3F` command triggers special handling in NetSIO:
+
+1. NetSIO's `debug_command_frame()` detects command `$3F` for the
+   network device and sets `hsio_pending = 1`.
+2. When the next SIO transfer arrives at a different speed, the
+   `rxbyte_thread_handler()` sees `out_cpb != $aux` with
+   `hsio_pending == 1`.
+3. NetSIO updates **both** `out_cpb` and `in_cpb` locally, then clears
+   `hsio_pending`.
+4. Critically, NetSIO does **not** send event `$80` to FujiNet-PC.
+   Sending `$80` would cause FujiNet-PC to update `_baud_peer`, and if
+   `_baud_peer` differs from `_baud` by >10%, `handle_netsio()` XOR-
+   corrupts received bytes.  The local-only update avoids this.
+
+#### Supported Configurations
+
+| OS Kernel             | Scan Strategy | Patch Target                     |
+|-----------------------|---------------|----------------------------------|
+| OSXL 65c816 (Rapidus) | 1 + 2        | Device-check BNE target + ZP $3F |
+| OSXL (standard XL/XE) | 1 + 2        | Device-check BNE target + ZP $3F |
+| Altirra built-in       | 3            | regdata_normal table AUDF3       |
+
 ### SIO Buzzer
 
 The SIO buzzer sound is silenced during terminal operation by zeroing
@@ -369,8 +543,9 @@ SOUNDR at `$41`.  The original value is restored on exit.
 
 | File                | Lines | Description                                    |
 |---------------------|-------|------------------------------------------------|
-| `src/ssh_terminal.c`| ~1935 | Main terminal: SIO, keyboard, VT100, ZMODEM   |
+| `src/ssh_terminal.c`| ~2000 | Main terminal: SIO, HSIO, keyboard, VT100, ZMODEM |
 | `src/intr.s`        | 22    | PROCEED interrupt handler (6502 assembly)      |
+| `src/hsio.s`        | 87    | ROM copy + disable (6502 assembly)             |
 | `build.sh`          | 12    | Build script                                   |
 
 ## Memory Layout
@@ -384,9 +559,9 @@ Typical memory map (from linker output):
 | DATA    | `$685C`–`$68E8` | ~0.1 KB  |
 | BSS     | `$68E9`–`$7570` | ~3.2 KB  |
 
-Total binary size: ~18 KB.  The BSS segment (uninitialized data) includes
-the 1024-byte receive buffer, 1024-byte ZMODEM I/O buffer, and various
-state variables.  `_trip` is at the start of BSS (`$68E9`).
+Total binary size: ~20 KB.  The BSS segment (uninitialized data) includes
+the 1024-byte receive buffer, 1024-byte ZMODEM I/O buffer, the 256-byte
+ROM copy buffer (`rombuf`), and various state variables.
 
 ## Limitations
 

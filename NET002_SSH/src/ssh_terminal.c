@@ -91,6 +91,9 @@
 volatile unsigned char trip;     /* set to 1 by interrupt handler */
 extern void ih(void);            /* assembly handler in intr.s */
 
+/* High-speed SIO — assembly ROM copy in hsio.s */
+extern void copy_rom_disable(void);
+
 static unsigned int old_vprced;
 static unsigned char old_pactl_bit;
 
@@ -118,7 +121,7 @@ static unsigned char old_pactl_bit;
 /* ------------------------------------------------------------------ */
 /* Buffers                                                            */
 /* ------------------------------------------------------------------ */
-#define RXBUF_SIZE 1024
+#define RXBUF_SIZE 4096
 
 static unsigned char devicespec[256];
 static unsigned char rxbuf[RXBUF_SIZE];
@@ -348,6 +351,136 @@ static unsigned char net_close(void)
 
     call_siov();
     return PEEK(DSTATS);
+}
+
+/* ------------------------------------------------------------------ */
+/* High-speed SIO (HSIO) negotiation                                  */
+/* ------------------------------------------------------------------ */
+
+/* Send $3F (Get High Speed Index) to FujiNet.
+   Returns POKEY divisor (AUDF3 value) for high-speed transfers,
+   or 0 if device doesn't support HSIO. */
+static unsigned char net_get_hsio_index(void)
+{
+    static unsigned char hsio_buf;
+    hsio_buf = 0;
+
+    sio_setup_net();
+    POKE(DCOMND, 0x3F);         /* Get High Speed Index */
+    POKE(DSTATS, SIO_READ);
+    POKE(DBUFLO, (unsigned)&hsio_buf & 0xFF);
+    POKE(DBUFHI, ((unsigned)&hsio_buf >> 8) & 0xFF);
+    POKE(DBYTLO, 1);
+    POKE(DBYTHI, 0);
+    POKE(DAUX1, 0);
+    POKE(DAUX2, 0);
+
+    call_siov();
+    if (PEEK(DSTATS) == 1)
+        return hsio_buf;
+    return 0;
+}
+
+/* Scan OS ROM/RAM for the byte that controls SIO baud rate (AUDF3).
+   Returns address of the AUDF3 byte to patch, or 0 if not found.
+   Does NOT require the byte to be $28 — works even if already patched.
+
+   Strategy 1 (OSXL 65c816): Find the SIO device-type check sequence:
+     LDA $0300; AND #$70; CMP #$30; BNE offset
+     (AD 00 03 29 70 C9 30 D0 xx)
+     Follow the BNE branch — target should be LDA #xx (A9 xx).
+
+   Strategy 2 (OSXL fallback): LDA #xx; STA $3F (A9 xx 85 3F)
+
+   Strategy 3 (Altirra kernel): regdata_normal table (00 A0 00 A0 xx A0 00 A0) */
+static unsigned find_sio_speed_byte(void)
+{
+    unsigned a;
+    signed char offset;
+    unsigned target;
+
+    /* Strategy 1: device-check pattern → follow BNE to LDA #xx */
+    for (a = 0xD800; a <= 0xFEF6; ++a) {
+        if (PEEK(a)   == 0xAD && PEEK(a+1) == 0x00 &&
+            PEEK(a+2) == 0x03 && PEEK(a+3) == 0x29 &&
+            PEEK(a+4) == 0x70 && PEEK(a+5) == 0xC9 &&
+            PEEK(a+6) == 0x30 && PEEK(a+7) == 0xD0) {
+            offset = (signed char)PEEK(a+8);
+            target = (unsigned)((int)(a + 9) + (int)offset);
+            if (PEEK(target) == 0xA9)
+                return target + 1;
+        }
+    }
+
+    /* Strategy 2: OSXL init — A9 xx 85 3F (LDA #xx; STA $3F) */
+    for (a = 0xD800; a <= 0xFEFC; ++a) {
+        if (PEEK(a)   == 0xA9 &&
+            PEEK(a+2) == 0x85 && PEEK(a+3) == 0x3F)
+            return a + 1;
+    }
+
+    /* Strategy 3: Altirra kernel regdata_normal — 00 A0 00 A0 xx A0 00 A0 */
+    for (a = 0xD800; a <= 0xFEF7; ++a) {
+        if (PEEK(a)   == 0x00 && PEEK(a+1) == 0xA0 &&
+            PEEK(a+2) == 0x00 && PEEK(a+3) == 0xA0 &&
+            PEEK(a+5) == 0xA0 &&
+            PEEK(a+6) == 0x00 && PEEK(a+7) == 0xA0)
+            return a + 4;
+    }
+
+    return 0;
+}
+
+/* Negotiate HSIO with FujiNet and patch OS ROM if supported.
+   Call before net_open() so all SIO runs at high speed. */
+static void enable_hsio_if_available(void)
+{
+    unsigned char audf3;
+    unsigned patch_addr;
+    unsigned a;
+
+    audf3 = net_get_hsio_index();
+    if (audf3 == 0 || audf3 >= 0x28)
+        return;
+
+    patch_addr = find_sio_speed_byte();
+    if (patch_addr == 0) {
+        printf("HSIO: not found\n");
+        return;
+    }
+
+    printf("HSIO: $%02X @$%04X", (unsigned)audf3, patch_addr);
+
+    /* Disable OS ROM so CPU runs from RAM underneath.
+       Skip if already disabled (bit 0 = 0) from a previous run. */
+    if (PEEK(0xD301) & 0x01)
+        copy_rom_disable();
+
+    /* Patch the primary target (non-disk default LDA #$28) */
+    POKE(patch_addr, audf3);
+
+    /* Patch OSXL init sequences: A9 xx 85 3F (LDA #xx; STA $3F) */
+    for (a = 0xD800; a <= 0xFEFC; ++a) {
+        if (PEEK(a)   == 0xA9 &&
+            PEEK(a+2) == 0x85 && PEEK(a+3) == 0x3F)
+            POKE(a+1, audf3);
+    }
+
+    /* Patch Altirra kernel regdata_normal table:
+       00 A0 00 A0 [xx] A0 00 A0 — AUDF3 is at offset +4 */
+    for (a = 0xD800; a <= 0xFEF7; ++a) {
+        if (PEEK(a)   == 0x00 && PEEK(a+1) == 0xA0 &&
+            PEEK(a+2) == 0x00 && PEEK(a+3) == 0xA0 &&
+            PEEK(a+5) == 0xA0 &&
+            PEEK(a+6) == 0x00 && PEEK(a+7) == 0xA0)
+            POKE(a+4, audf3);
+    }
+
+    /* Set ZP $3F/$40 for OSXL immediate use */
+    POKE(0x3F, audf3);
+    POKE(0x40, audf3);
+
+    printf(" OK %02X\n", (unsigned)PEEK(patch_addr));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1024,7 +1157,7 @@ static void setup_remote_terminal(unsigned char cols)
 /* Note: CANFC32 (0x20) NOT advertised — CRC-16 only */
 
 /* ---- I/O buffer -------------------------------------------------- */
-#define ZM_IOBUF_SIZE 1024
+#define ZM_IOBUF_SIZE 4096
 
 /* ---- IOCB 1 for file output ($0350) ------------------------------ */
 #define IOCB1_BASE  0x0350
@@ -1047,6 +1180,7 @@ static unsigned char zm_crc_bytes;       /* 2=CRC-16, 4=CRC-32 */
 static unsigned char zm_detect_state;    /* Auto-detect FSM state */
 static unsigned char zm_file_is_open;    /* IOCB 1 open flag */
 static unsigned char zm_text_mode;       /* 1=convert LF→$9B on write */
+static unsigned int zm_net_avail;        /* remaining bytes from last STATUS */
 
 /* ---- ZMODEM mode selection (inline prompt) ----------------------- */
 /* Returns 0=binary, 1=text.                                          */
@@ -1078,6 +1212,7 @@ static void zm_ungetbyte(unsigned char b)
 
 /* ---- Refill rxbuf from network ----------------------------------- */
 /* Returns number of bytes read, 0 on nothing available, -1 on error.  */
+/* Skips STATUS when we know data remains from a previous STATUS call.  */
 static int zm_refill(void)
 {
     unsigned int avail;
@@ -1085,19 +1220,33 @@ static int zm_refill(void)
     unsigned char sts;
 
     while (1) {
-        sts = net_status();
-        if (sts != 1) return -1;   /* SIO error */
-        avail = (unsigned int)status_buf[0] |
-                ((unsigned int)status_buf[1] << 8);
-        if (avail > 0) {
-            if (avail > RXBUF_SIZE) avail = RXBUF_SIZE;
-            net_read(rxbuf, avail);
-            zm_rxpos = 0;
-            zm_rxlen = avail;
-            return (int)avail;
+        if (zm_net_avail > 0) {
+            /* Data remaining from previous STATUS — skip STATUS call */
+            avail = zm_net_avail;
+        } else {
+            sts = net_status();
+            if (sts != 1) return -1;   /* SIO error */
+            avail = (unsigned int)status_buf[0] |
+                    ((unsigned int)status_buf[1] << 8);
+            if (avail == 0) {
+                if (!status_buf[2]) return -1;   /* disconnected */
+                if (++timeout > 30000) return -1;  /* timeout */
+                continue;
+            }
         }
-        if (!status_buf[2]) return -1;   /* disconnected */
-        if (++timeout > 30000) return -1;  /* timeout */
+
+        if (avail > RXBUF_SIZE) {
+            zm_net_avail = avail - RXBUF_SIZE;
+            avail = RXBUF_SIZE;
+        } else {
+            zm_net_avail = 0;
+        }
+
+        sts = net_read(rxbuf, avail);
+        if (sts != 1) { zm_net_avail = 0; return -1; }
+        zm_rxpos = 0;
+        zm_rxlen = avail;
+        return (int)avail;
     }
 }
 
@@ -1562,6 +1711,7 @@ static void zmodem_receive(void)
 
     zm_file_is_open = 0;
     zm_file_offset = 0;
+    zm_net_avail = 0;
 
     /* Step 1: Read ZRQINIT (from pushback + network) */
     if (zm_read_header(&hdr_type, hdr_data) < 0 ||
@@ -1571,7 +1721,7 @@ static void zmodem_receive(void)
 
     /* Step 2: Send ZRINIT */
     /* zp0=0x00, zp1=0x01 (MaxDataLen=256), zf1=0x00, zf0=CANFDX */
-    zm_send_hex_hdr(ZM_ZRINIT, 0x00, 0x04, 0x00, ZM_CANFDX);
+    zm_send_hex_hdr(ZM_ZRINIT, 0x00, 0x20, 0x00, ZM_CANFDX);
 
     /* Step 3: Read ZFILE */
     if (zm_read_header(&hdr_type, hdr_data) < 0) {
@@ -1669,7 +1819,7 @@ static void zmodem_receive(void)
 
     printf("] %lu bytes received.", zm_file_offset);
 
-    zm_send_hex_hdr(ZM_ZRINIT, 0x00, 0x04, 0x00, ZM_CANFDX);
+    zm_send_hex_hdr(ZM_ZRINIT, 0x00, 0x20, 0x00, ZM_CANFDX);
 
     if (zm_read_header(&hdr_type, hdr_data) >= 0 &&
         hdr_type == ZM_ZFIN) {
@@ -1821,15 +1971,17 @@ int main(void)
     read_input(input_pass, INPUT_MAX, 1);
 #endif
 
-    printf("\nConnecting to %s as %s...",
-           input_host, input_user);
-
     /* Build devicespec: N:SSH://user:pass@host:port/ */
     sprintf((char *)devicespec,
             "N:SSH://%s:%s@%s:%u/\x9b",
             input_user, input_pass, input_host, SSH_PORT);
 
+    /* Try high-speed SIO — patches Altirra kernel's AUDF3 for ~112kbit */
+    enable_hsio_if_available();
+
     /* OPEN — this triggers SSH handshake + auth on FujiNet */
+    printf("\nConnecting to %s as %s...",
+           input_host, input_user);
     POKE(DTIMLO, 60);  /* longer timeout for SSH handshake */
     sts = net_open();
     if (sts != 1) {
