@@ -60,6 +60,18 @@ HSIO is negotiated and installed automatically on each run.
 This option is useful when you want HSIO to benefit multiple
 programs without each one carrying its own HSIO code.
 
+### Option C: Pre-patched ROM (`XLOS816A_248_HSIO.ROM`)
+
+1. In Altirra: **System > Firmware > OS Firmware > Custom...**
+2. Select `XLOS816A_248_HSIO.ROM` from `PROJECTS/sdx-rom/`.
+3. Load the modified `netsio.atdevice` (from `extras/altirra-custom-device/`)
+   in **System > Configure System > Devices > Custom Device**.
+4. Cold reset — all non-disk SIO now runs at ~112 kbit/s automatically.
+5. Run `ssh.com` (or any other FujiNet program) — no `hsioset.com` needed.
+
+HSIO is built into the ROM.  No runtime patching required.
+See `PROJECTS/sdx-rom/README_RapidusOS_HSIO.md` for details.
+
 ### ZMODEM file transfer
 
 To receive a file via ZMODEM, run `sz filename` on the remote host.
@@ -554,6 +566,13 @@ The `$3F` command triggers special handling in NetSIO:
    Sending `$80` would cause FujiNet-PC to update `_baud_peer`, and if
    `_baud_peer` differs from `_baud` by >10%, `handle_netsio()` XOR-
    corrupts received bytes.  The local-only update avoids this.
+
+NetSIO initializes `hsio_pending = 1` on cold reset.  This ensures
+pre-patched ROMs (which start at high speed immediately without sending
+`$3F`) work correctly — the first speed change after reset is treated
+as HSIO negotiation (local-only update, no event `$80`).  For the
+runtime patching path (`hsioset.com` / `ssh_terminal.com`), the `$3F`
+command sets `hsio_pending = 1` redundantly, which is harmless.
 
 #### Supported Configurations
 

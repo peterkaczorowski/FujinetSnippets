@@ -28,8 +28,11 @@ support HSIO negotiation initiated by the Atari side:
    - If `hsio_pending == 0`: standard behavior — updates `out_cpb`
      only and sends event `$80` to FujiNet-PC.
 
-4. **Cold reset** (line 647) — clears `hsio_pending = 0` on system
-   reset.
+4. **Cold reset** (line 647) — sets `hsio_pending = 1` on system
+   reset.  This ensures pre-patched ROMs (which start at high speed
+   immediately without sending `$3F`) work correctly — the first
+   speed change after reset is treated as HSIO negotiation (local-only
+   update, no event `$80`).
 
 ### Why No Event `$80`
 
