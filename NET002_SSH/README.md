@@ -534,8 +534,9 @@ locations — not just the primary target:
 
 #### NetSIO Integration
 
-When running under the Altirra emulator with the NetSIO custom device
-(`netsio.atdevice`), the speed change propagates automatically.  NetSIO
+When running under the Altirra emulator with the NetSIO custom device,
+the speed change propagates automatically.  A modified `netsio.atdevice`
+with HSIO support is included in `extras/altirra-custom-device/`.  NetSIO
 operates in raw SIO mode (`$sio.enable_raw(true)`) and detects baud
 rate changes by monitoring the per-byte timing (`$aux` variable in
 `recv_raw_byte()`).
@@ -576,7 +577,8 @@ SOUNDR at `$41`.  The original value is restored on exit.
 | `src/hsioset.c`     | ~150  | Standalone HSIO installer                      |
 | `src/intr.s`        | 22    | PROCEED interrupt handler (6502 assembly)      |
 | `src/hsio.s`        | 87    | ROM copy + disable (6502 assembly)             |
-| `build.sh`          | 12    | Build script                                   |
+| `build.sh`          | 17    | Build script                                   |
+| `extras/altirra-custom-device/netsio.atdevice` | — | NetSIO with HSIO support |
 
 ## Memory Layout
 
