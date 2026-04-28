@@ -22,17 +22,45 @@ file receive.
 Or manually:
 
 ```bash
+# All-in-one (SSH terminal with built-in HSIO)
 cl65 -t atari -o build/ssh_terminal.com src/ssh_terminal.c src/intr.s src/hsio.s
+
+# Separate binaries (smaller SSH terminal + standalone HSIO installer)
+cl65 -t atari -o build/ssh.com src/ssh.c src/intr.s
+cl65 -t atari -o build/hsioset.com src/hsioset.c src/hsio.s
 ```
 
-Output: `build/ssh_terminal.com` (~20 KB).
+Output:
+
+| Binary                  | Size    | Description                          |
+|-------------------------|---------|--------------------------------------|
+| `build/ssh_terminal.com`| ~20 KB  | SSH terminal with built-in HSIO      |
+| `build/ssh.com`         | ~19 KB  | SSH terminal without HSIO            |
+| `build/hsioset.com`     | ~5 KB   | Standalone HSIO installer            |
 
 ## Usage
+
+### Option A: All-in-one (`ssh_terminal.com`)
 
 1. Boot the Atari with FujiNet connected (or FujiNet-PC running).
 2. Load and run `ssh_terminal.com`.
 3. Enter the SSH host address, login, and password when prompted.
 4. Use the terminal normally.  Type `exit` or `logout` to disconnect.
+
+HSIO is negotiated and installed automatically on each run.
+
+### Option B: Separate binaries (`hsioset.com` + `ssh.com`)
+
+1. Boot the Atari with FujiNet connected.
+2. Run `hsioset.com` once — patches the OS for high-speed SIO.
+   The patch is resident until cold reset.
+3. Run `ssh.com` (or any other FujiNet program) — it will use
+   the high-speed SIO automatically.
+
+This option is useful when you want HSIO to benefit multiple
+programs without each one carrying its own HSIO code.
+
+### ZMODEM file transfer
 
 To receive a file via ZMODEM, run `sz filename` on the remote host.
 The terminal detects the ZMODEM sequence automatically, prompts for
@@ -543,7 +571,9 @@ SOUNDR at `$41`.  The original value is restored on exit.
 
 | File                | Lines | Description                                    |
 |---------------------|-------|------------------------------------------------|
-| `src/ssh_terminal.c`| ~2000 | Main terminal: SIO, HSIO, keyboard, VT100, ZMODEM |
+| `src/ssh_terminal.c`| ~2000 | SSH terminal with built-in HSIO                |
+| `src/ssh.c`         | ~1870 | SSH terminal without HSIO (use with hsioset)   |
+| `src/hsioset.c`     | ~150  | Standalone HSIO installer                      |
 | `src/intr.s`        | 22    | PROCEED interrupt handler (6502 assembly)      |
 | `src/hsio.s`        | 87    | ROM copy + disable (6502 assembly)             |
 | `build.sh`          | 12    | Build script                                   |
