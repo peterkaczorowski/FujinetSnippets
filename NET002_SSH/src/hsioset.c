@@ -65,6 +65,11 @@ static unsigned char net_get_hsio_index(void)
     return 0;
 }
 
+/* Which scan strategy matched (1=OSXL device-check, 2=OSXL init, 3=Altirra) */
+static unsigned char patch_strategy;
+/* Strategy 1: address of the LDA opcode at the BNE target */
+static unsigned osxl_lda_addr;
+
 /* Scan OS ROM/RAM for the AUDF3 byte to patch.
    Three strategies for different OS kernels. */
 static unsigned find_sio_speed_byte(void)
@@ -81,16 +86,21 @@ static unsigned find_sio_speed_byte(void)
             PEEK(a+6) == 0x30 && PEEK(a+7) == 0xD0) {
             offset = (signed char)PEEK(a+8);
             target = (unsigned)((int)(a + 9) + (int)offset);
-            if (PEEK(target) == 0xA9)
+            if (PEEK(target) == 0xA9) {
+                patch_strategy = 1;
+                osxl_lda_addr = target;
                 return target + 1;
+            }
         }
     }
 
     /* Strategy 2: OSXL init — A9 xx 85 3F */
     for (a = 0xD800; a <= 0xFEFC; ++a) {
         if (PEEK(a)   == 0xA9 &&
-            PEEK(a+2) == 0x85 && PEEK(a+3) == 0x3F)
+            PEEK(a+2) == 0x85 && PEEK(a+3) == 0x3F) {
+            patch_strategy = 2;
             return a + 1;
+        }
     }
 
     /* Strategy 3: Altirra kernel regdata_normal */
@@ -98,11 +108,54 @@ static unsigned find_sio_speed_byte(void)
         if (PEEK(a)   == 0x00 && PEEK(a+1) == 0xA0 &&
             PEEK(a+2) == 0x00 && PEEK(a+3) == 0xA0 &&
             PEEK(a+5) == 0xA0 &&
-            PEEK(a+6) == 0x00 && PEEK(a+7) == 0xA0)
+            PEEK(a+6) == 0x00 && PEEK(a+7) == 0xA0) {
+            patch_strategy = 3;
             return a + 4;
+        }
     }
 
     return 0;
+}
+
+/* Install a JMP trampoline at $FFBD that separates non-disk (fast)
+   from disk-fallback (standard $28) traffic.  This avoids breaking
+   disk $3F HSIO negotiation which shares the same default path.
+   lda_addr = address of LDA #xx; BRA xx (4 bytes to replace). */
+static void install_osxl_trampoline(unsigned lda_addr, unsigned char audf3)
+{
+    unsigned store_addr;
+    signed char bra_off;
+    unsigned i;
+
+    /* Compute BRA target (store epilogue) from original code */
+    if (PEEK(lda_addr + 2) != 0x80)
+        return;
+    bra_off = (signed char)PEEK(lda_addr + 3);
+    store_addr = (unsigned)((int)(lda_addr + 4) + (int)bra_off);
+
+    /* Verify $FFBD-$FFCF are free (all zeros) */
+    for (i = 0xFFBD; i <= 0xFFCF; ++i) {
+        if (PEEK(i) != 0x00)
+            return;
+    }
+
+    /* Write 19-byte trampoline at $FFBD */
+    POKE(0xFFBD, 0xAD); POKE(0xFFBE, 0x00); POKE(0xFFBF, 0x03);
+    POKE(0xFFC0, 0x29); POKE(0xFFC1, 0x70);
+    POKE(0xFFC2, 0xC9); POKE(0xFFC3, 0x30);
+    POKE(0xFFC4, 0xF0); POKE(0xFFC5, 0x05);
+    POKE(0xFFC6, 0xA9); POKE(0xFFC7, audf3);
+    POKE(0xFFC8, 0x4C); POKE(0xFFC9, store_addr & 0xFF);
+    POKE(0xFFCA, (store_addr >> 8) & 0xFF);
+    POKE(0xFFCB, 0xA9); POKE(0xFFCC, 0x28);
+    POKE(0xFFCD, 0x4C); POKE(0xFFCE, store_addr & 0xFF);
+    POKE(0xFFCF, (store_addr >> 8) & 0xFF);
+
+    /* Replace LDA #xx; BRA xx with JMP $FFBD; NOP */
+    POKE(lda_addr,     0x4C);
+    POKE(lda_addr + 1, 0xBD);
+    POKE(lda_addr + 2, 0xFF);
+    POKE(lda_addr + 3, 0xEA);
 }
 
 int main(void)
@@ -127,8 +180,19 @@ int main(void)
     if (PEEK(0xD301) & 0x01)
         copy_rom_disable();
 
-    /* Patch primary target */
-    POKE(patch_addr, audf3);
+    /* Strategy 1 (OSXL device-check): install JMP trampoline at $FFBD
+       to separate non-disk (fast) from disk (standard $28) paths.
+       Without this, disk $3F HSIO negotiation would also run at high speed. */
+    if (patch_strategy == 1) {
+        install_osxl_trampoline(osxl_lda_addr, audf3);
+    } else {
+        /* Strategy 2/3: patch operand directly */
+        POKE(patch_addr, audf3);
+    }
+
+    /* Update trampoline speed byte on repeat runs */
+    if (PEEK(0xFFBD) == 0xAD)
+        POKE(0xFFC7, audf3);
 
     /* Patch OSXL init sequences: A9 xx 85 3F */
     for (a = 0xD800; a <= 0xFEFC; ++a) {
