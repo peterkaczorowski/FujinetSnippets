@@ -463,13 +463,16 @@ C9 30       CMP #$30        ; compare with disk ($3x)
 D0 xx       BNE offset      ; branch if not disk
 ```
 
-The BNE target contains `A9 xx` (LDA #immediate) — the operand is the
-AUDF3 byte to patch.
+The BNE target contains `A9 xx` (LDA #immediate).  However, this
+location is a **shared default** — both non-disk devices and disk
+fallback cases (including `$3F` HSIO negotiation) branch here.
+Simply patching the operand would break disk `$3F` queries by sending
+them at high speed instead of standard 19200 baud.
 
 **Strategy 2 — OSXL init function** (fallback):
 
 Scans for `A9 xx 85 3F` (LDA #xx; STA $3F), where zero-page `$3F` is
-the OSXL's AUDF3 output-direction variable.
+a temporary OSXL SIO variable holding the AUDF3 divisor.
 
 **Strategy 3 — Altirra kernel regdata_normal** (for built-in kernel):
 
@@ -528,20 +531,52 @@ the RAM copy.
 On repeat runs, the ROM copy is skipped if PORTB bit 0 is already 0
 (ROM already disabled from a previous run).
 
+##### JMP Trampoline (Strategy 1)
+
+When Strategy 1 matches (OSXL device-check), the shared default at the
+BNE target cannot be patched directly — doing so would also affect disk
+`$3F` (Get HSIO Index) and `$58` commands, which must run at standard
+19200 baud for correct HSIO negotiation with disk drives.
+
+Instead, `install_osxl_trampoline()` replaces the 4-byte `LDA #$28;
+BRA offset` at the BNE target with `JMP $FFBD; NOP`, and writes a
+19-byte trampoline at `$FFBD` (verified free space before the vector
+table).  The trampoline re-reads DDEVIC and dispatches:
+
+- **Non-disk** (device class ≠ `$3x`): AUDF3 = negotiated value → fast
+- **Disk fallback** (device class = `$3x`): AUDF3 = `$28` → standard
+
+```
+$FFBD: LDA $0300       ; re-read DDEVIC
+$FFC0: AND #$70        ; mask device class
+$FFC2: CMP #$30        ; disk?
+$FFC4: BEQ +5          ; yes → standard speed
+$FFC6: LDA #audf3      ; non-disk: fast
+$FFC8: JMP store_addr  ; → store epilogue
+$FFCB: LDA #$28        ; disk: standard
+$FFCD: JMP store_addr  ; → store epilogue
+```
+
+The store epilogue address is computed dynamically from the original
+BRA operand, so the trampoline works with any OSXL ROM variant where
+the BNE target has `LDA #xx; BRA offset`.
+
+On repeat runs (trampoline already installed), Strategy 1 fails (LDA
+opcode replaced by JMP), the scan falls through to Strategy 2 (init
+function), and the trampoline's speed byte at `$FFC7` is updated.
+
 ##### Multi-Target Patching
 
-After the ROM copy, `enable_hsio_if_available()` patches all relevant
-locations — not just the primary target:
+After the ROM copy and trampoline install, `enable_hsio_if_available()`
+patches additional locations:
 
-1. **Primary target** from `find_sio_speed_byte()` (the device-check
-   branch target or regdata_normal entry).
-2. **All OSXL init sequences**: scans for `A9 xx 85 3F` and patches
+1. **All OSXL init sequences**: scans for `A9 xx 85 3F` and patches
    the operand.  This covers the OSXL SIO init function and any other
    code path that sets zero-page `$3F`.
-3. **All regdata_normal tables**: scans for `00 A0 00 A0 xx A0 00 A0`
+2. **All regdata_normal tables**: scans for `00 A0 00 A0 xx A0 00 A0`
    and patches offset +4.  Only AUDF3 is changed — AUDCTL at offset +8
    (`$28` = clock channels 3&4 at 1.79 MHz) is left untouched.
-4. **Zero-page `$3F`/`$40`**: POKEd with the new AUDF3 value for
+3. **Zero-page `$3F`/`$40`**: POKEd with the new AUDF3 value for
    immediate use by the next SIOV call (OSXL only).
 
 #### NetSIO Integration
@@ -576,11 +611,11 @@ command sets `hsio_pending = 1` redundantly, which is harmless.
 
 #### Supported Configurations
 
-| OS Kernel             | Scan Strategy | Patch Target                     |
-|-----------------------|---------------|----------------------------------|
-| OSXL 65c816 (Rapidus) | 1 + 2        | Device-check BNE target + ZP $3F |
-| OSXL (standard XL/XE) | 1 + 2        | Device-check BNE target + ZP $3F |
-| Altirra built-in       | 3            | regdata_normal table AUDF3       |
+| OS Kernel             | Scan Strategy | Patch Method                          |
+|-----------------------|---------------|---------------------------------------|
+| OSXL 65c816 (Rapidus) | 1 + 2        | JMP trampoline at `$FFBD` + ZP `$3F` |
+| OSXL (standard XL/XE) | 1 + 2        | JMP trampoline at `$FFBD` + ZP `$3F` |
+| Altirra built-in       | 3            | regdata_normal table AUDF3 (direct)   |
 
 ### SIO Buzzer
 
