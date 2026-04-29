@@ -348,6 +348,7 @@ static unsigned char net_close(void)
     POKE(DBYTHI, 0);
     POKE(DAUX1, 0);
     POKE(DAUX2, 0);
+    POKE(DTIMLO, 2);   /* short timeout — device may already be gone */
 
     call_siov();
     return PEEK(DSTATS);
@@ -2140,6 +2141,10 @@ int main(void)
 
     /* ---- Cleanup ---- */
     remove_proceed();
+    /* Keep PROCEED disabled — FujiNet may still pulse the line after
+       disconnect, and the default OS handler can't cope with rapid-fire
+       IRQs (each RTI allows one instruction before the next edge fires). */
+    POKE(PACTL, PEEK(PACTL) & ~1);
     printf("\nClosing...");
     net_close();
     printf(" Done.\n");
