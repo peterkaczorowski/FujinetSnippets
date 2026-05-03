@@ -45,6 +45,21 @@
 #define INPUT_MAX 63
 #define TERM_ROWS 24
 
+/* Hardcoded login defaults (override with -DHARDCODED_HOST=\"...\" etc.) */
+#if defined(HARDCODED_LOGIN) || defined(HARDCODED_KEYAUTH)
+#ifndef HARDCODED_HOST
+#define HARDCODED_HOST "192.168.1.20"
+#endif
+#ifndef HARDCODED_USER
+#define HARDCODED_USER "test"
+#endif
+#endif
+#ifdef HARDCODED_LOGIN
+#ifndef HARDCODED_PASS
+#define HARDCODED_PASS "test"
+#endif
+#endif
+
 /* RMARGN ($0053) — right margin of screen editor.
    39 = 40-column mode, 79 = 80-column mode (e.g. VBXE CON 80). */
 #define RMARGN 0x0053
@@ -1808,11 +1823,15 @@ int main(void)
     printf("Terminal: vt100 %ux%u\n\n",
            (unsigned)term_cols, (unsigned)TERM_ROWS);
 
-#ifdef HARDCODED_LOGIN
-    /* Hardcoded credentials for testing */
-    strcpy(input_host, "192.168.1.20");
-    strcpy(input_user, "test");
-    strcpy(input_pass, "helloworld");
+#ifdef HARDCODED_KEYAUTH
+    /* Hardcoded host/user for public-key auth testing (no password) */
+    strcpy(input_host, HARDCODED_HOST);
+    strcpy(input_user, HARDCODED_USER);
+#elif defined(HARDCODED_LOGIN)
+    /* Hardcoded credentials for password auth testing */
+    strcpy(input_host, HARDCODED_HOST);
+    strcpy(input_user, HARDCODED_USER);
+    strcpy(input_pass, HARDCODED_PASS);
 #else
     /* Prompt for host */
     printf("Host: ");
@@ -1839,10 +1858,18 @@ int main(void)
     read_input(input_pass, INPUT_MAX, 1);
 #endif
 
-    /* Build devicespec: N:SSH://user:pass@host:port/ */
+    /* Build devicespec */
+#ifdef HARDCODED_KEYAUTH
+    /* Public-key auth: N:SSH://user@host:port/ (no password) */
+    sprintf((char *)devicespec,
+            "N:SSH://%s@%s:%u/\x9b",
+            input_user, input_host, SSH_PORT);
+#else
+    /* Password auth: N:SSH://user:pass@host:port/ */
     sprintf((char *)devicespec,
             "N:SSH://%s:%s@%s:%u/\x9b",
             input_user, input_pass, input_host, SSH_PORT);
+#endif
 
     /* OPEN — this triggers SSH handshake + auth on FujiNet */
     printf("\nConnecting to %s as %s...",
